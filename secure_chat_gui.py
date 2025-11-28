@@ -66,7 +66,7 @@ def recv_frame(sock):
     return recv_exact(sock, length)
 
 
-# ---------- Kättely (Ed25519-identiteetti + X25519-ephemeral) ----------
+# ---------- Kättely (symmetrinen, molemmat tekevät saman) ----------
 
 def make_handshake_message(identity_sk: SigningKey, eph_sk: PrivateKey):
     eph_pk_bytes = eph_sk.public_key.encode()
@@ -100,7 +100,13 @@ def parse_handshake_message(data: bytes):
     return peer_eph_pk, peer_fp
 
 
-def perform_handshake_client(sock, identity_sk: SigningKey):
+def perform_handshake(sock, identity_sk: SigningKey):
+    """
+    Symmetrinen kättely: molemmat osapuolet:
+      - generoi ephemeral-avaimen
+      - lähettää oman handshake-viestin
+      - lukee vastapuolen handshake-viestin
+    """
     eph_sk = PrivateKey.generate()
     outbound = make_handshake_message(identity_sk, eph_sk)
     send_frame(sock, outbound)
@@ -108,18 +114,6 @@ def perform_handshake_client(sock, identity_sk: SigningKey):
     if inbound is None:
         raise RuntimeError("Connection closed during handshake")
     peer_eph_pk, peer_fp = parse_handshake_message(inbound)
-    box = Box(eph_sk, peer_eph_pk)
-    return box, peer_fp
-
-
-def perform_handshake_server(sock, identity_sk: SigningKey):
-    eph_sk = PrivateKey.generate()
-    inbound = recv_frame(sock)
-    if inbound is None:
-        raise RuntimeError("Connection closed during handshake")
-    peer_eph_pk, peer_fp = parse_handshake_message(inbound)
-    outbound = make_handshake_message(identity_sk, eph_sk)
-    send_frame(sock, outbound)
     box = Box(eph_sk, peer_eph_pk)
     return box, peer_fp
 
@@ -142,28 +136,29 @@ def recv_secure_message(sock, box: Box):
     return msg_obj
 
 
-# ---------- Ydin: yhdistetty server + client ----------
+# ---------- Ydin: yhdistetty server + client + valinnainen proxy ----------
 
 class SecureChatCore:
     """
-    Tämä yksi luokka hoitaa:
-    - kuuntelun (palvelinrooli),
-    - ulospäin yhdistämisen (client-rooli),
+    Hoitaa:
+    - kuuntelun (suora P2P),
+    - ulospäin yhdistämisen suoraan,
+    - yhdistämisen välipalvelimen (proxy) kautta,
     - salauksen ja luku-kuittaukset.
-    Yksi aktiivinen yhteys kerrallaan.
     """
 
     def __init__(self, event_queue: "queue.Queue"):
         self.event_queue = event_queue
         self.identity_sk, self.identity_vk, self.my_fingerprint, created = load_or_create_identity()
 
+        # Kuuntelu (suora P2P)
         self.listen_sock = None
         self.listen_thread = None
         self.listen_running = False
 
+        # Aktiivinen yhteys (suora tai proxy)
         self.sock = None
         self.box = None
-        self.conn_thread = None
         self.recv_thread = None
         self.conn_active = False
 
@@ -177,7 +172,7 @@ class SecureChatCore:
             self.event_queue.put(("status", "Käytetään olemassa olevaa identiteettiä."))
         self.event_queue.put(("my_fp", self.my_fingerprint))
 
-    # ---- Kuuntelu (server-rooli) ----
+    # ---- Kuuntelu (suora P2P) ----
 
     def start_listener(self, host: str, port: int):
         if self.listen_running:
@@ -194,23 +189,22 @@ class SecureChatCore:
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind((host, port))
             srv.listen(5)
-            self.event_queue.put(("status", f"Kuunnellaan {host}:{port} ..."))
+            self.event_queue.put(("status", f"Kuunnellaan {host}:{port} (suora P2P)..."))
             while self.listen_running:
                 try:
                     srv.settimeout(1.0)
                     conn, addr = srv.accept()
                 except socket.timeout:
                     continue
-                self.event_queue.put(("status", f"Saapuva yhteys {addr}"))
+                self.event_queue.put(("status", f"Saapuva suora yhteys {addr}"))
                 if self.conn_active:
-                    # Yksi yhteys kerrallaan -> suljetaan uusi
                     self.event_queue.put(("system", "Uusi saapuva yhteys hylätty (yhteys on jo aktiivinen)."))
                     try:
                         conn.close()
                     except OSError:
                         pass
                     continue
-                t = threading.Thread(target=self._handle_new_connection, args=(conn, addr), daemon=True)
+                t = threading.Thread(target=self._handle_new_direct_connection, args=(conn, addr), daemon=True)
                 t.start()
         except Exception as e:
             self.event_queue.put(("error", f"Kuunteluvirhe: {e}"))
@@ -223,50 +217,90 @@ class SecureChatCore:
             self.listen_running = False
             self.event_queue.put(("status", "Kuuntelu pysäytetty."))
 
-    def _handle_new_connection(self, conn: socket.socket, addr):
+    def _handle_new_direct_connection(self, conn: socket.socket, addr):
         with self.sock_lock:
             self.sock = conn
         try:
-            box, peer_fp = perform_handshake_server(conn, self.identity_sk)
+            box, peer_fp = perform_handshake(conn, self.identity_sk)
         except Exception as e:
-            self.event_queue.put(("error", f"Kättely epäonnistui (saapuva): {e}"))
+            self.event_queue.put(("error", f"Kättely epäonnistui (saapuva suora): {e}"))
             self._clear_connection()
             return
         self.box = box
         self.conn_active = True
         self.event_queue.put(("peer_fp", peer_fp))
-        self.event_queue.put(("connected", f"Saapuva yhteys {addr}"))
+        self.event_queue.put(("connected", f"Suora saapuva yhteys {addr}"))
         self._start_recv_loop()
 
-    # ---- Ulospäin yhdistäminen (client-rooli) ----
+    # ---- Ulospäin yhdistäminen suoraan ----
 
-    def connect_to(self, host: str, port: int):
+    def connect_direct(self, host: str, port: int):
         if self.conn_active:
             self.event_queue.put(("error", "Yhteys on jo aktiivinen. Katkaise ensin."))
             return
-        self.conn_thread = threading.Thread(target=self._connect_thread, args=(host, port), daemon=True)
-        self.conn_thread.start()
+        t = threading.Thread(target=self._connect_direct_thread, args=(host, port), daemon=True)
+        t.start()
 
-    def _connect_thread(self, host: str, port: int):
-        self.event_queue.put(("status", f"Yhdistetään {host}:{port} ..."))
+    def _connect_direct_thread(self, host: str, port: int):
+        self.event_queue.put(("status", f"Yhdistetään suoraan {host}:{port} ..."))
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             sock.connect((host, port))
             with self.sock_lock:
                 self.sock = sock
             try:
-                box, peer_fp = perform_handshake_client(sock, self.identity_sk)
+                box, peer_fp = perform_handshake(sock, self.identity_sk)
             except Exception as e:
-                self.event_queue.put(("error", f"Kättely epäonnistui (lähtevä): {e}"))
+                self.event_queue.put(("error", f"Kättely epäonnistui (lähtevä suora): {e}"))
                 self._clear_connection()
                 return
             self.box = box
             self.conn_active = True
             self.event_queue.put(("peer_fp", peer_fp))
-            self.event_queue.put(("connected", f"Yhdistetty {host}:{port}"))
+            self.event_queue.put(("connected", f"Suora yhteys {host}:{port}"))
             self._start_recv_loop()
         except Exception as e:
-            self.event_queue.put(("error", f"Yhteyden muodostus epäonnistui: {e}"))
+            self.event_queue.put(("error", f"Suora yhteys epäonnistui: {e}"))
+            self._clear_connection()
+
+    # ---- Yhdistäminen välipalvelimen (proxy) kautta ----
+
+    def connect_via_proxy(self, proxy_host: str, proxy_port: int, room: str):
+        if self.conn_active:
+            self.event_queue.put(("error", "Yhteys on jo aktiivinen. Katkaise ensin."))
+            return
+        t = threading.Thread(target=self._connect_proxy_thread, args=(proxy_host, proxy_port, room), daemon=True)
+        t.start()
+
+    def _connect_proxy_thread(self, proxy_host: str, proxy_port: int, room: str):
+        self.event_queue.put(("status", f"Yhdistetään välipalvelimeen {proxy_host}:{proxy_port}, huone '{room}' ..."))
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.connect((proxy_host, proxy_port))
+            # Ilmoita huone välipalvelimelle
+            join_msg = {"type": "join", "room": room}
+            try:
+                send_frame(sock, json.dumps(join_msg).encode("utf-8"))
+            except Exception as e:
+                self.event_queue.put(("error", f"Huoneen lähetys epäonnistui: {e}"))
+                self._clear_connection()
+                return
+            with self.sock_lock:
+                self.sock = sock
+            # Symmetrinen kättely vastapuolen kanssa välipalvelimen kautta
+            try:
+                box, peer_fp = perform_handshake(sock, self.identity_sk)
+            except Exception as e:
+                self.event_queue.put(("error", f"Kättely epäonnistui (proxy): {e}"))
+                self._clear_connection()
+                return
+            self.box = box
+            self.conn_active = True
+            self.event_queue.put(("peer_fp", peer_fp))
+            self.event_queue.put(("connected", f"Yhteys välipalvelimen kautta huoneessa '{room}'"))
+            self._start_recv_loop()
+        except Exception as e:
+            self.event_queue.put(("error", f"Yhteys välipalvelimeen epäonnistui: {e}"))
             self._clear_connection()
 
     # ---- Vastaanottosilmukka ----
@@ -356,13 +390,54 @@ class SecureChatCore:
         self.event_queue.put(("status", "Sovellus pysäytetty."))
 
 
+# ---------- IP-osoitteiden selvittäminen ----------
+
+def get_lan_ip():
+    """Yritetään löytää LAN-osoite."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # Ei tarvitse olla oikea, ei edes tarvitse saada yhteyttä
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        return ip
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "tuntematon"
+
+
+def get_wan_ip():
+    """Yritetään kysyä julkinen IP muutamasta palvelusta."""
+    try:
+        import urllib.request
+        urls = [
+            "https://api.ipify.org",
+            "https://ifconfig.me/ip",
+        ]
+        for url in urls:
+            try:
+                with urllib.request.urlopen(url, timeout=3) as resp:
+                    data = resp.read().decode("utf-8").strip()
+                    if data:
+                        return data
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return "tuntematon"
+
+
 # ---------- GUI ----------
 
 class SecureChatApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Tietoturvallinen P2P-viestintä (yhdistetty client/server)")
-        self.root.geometry("950x650")
+        self.root.title("Tietoturvallinen P2P-viestintä (suora + proxy)")
+        self.root.geometry("1000x700")
 
         self.event_queue = queue.Queue()
         self.core = SecureChatCore(self.event_queue)
@@ -372,6 +447,9 @@ class SecureChatApp:
         self._build_ui()
         self.root.after(100, self._poll_events)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Hae IP:t heti alussa
+        self._update_ips_async()
 
     def _build_ui(self):
         mainframe = ttk.Frame(self.root, padding=10)
@@ -390,21 +468,39 @@ class SecureChatApp:
         fp_entry.grid(row=0, column=1, sticky="we", padx=5, pady=5)
         id_frame.columnconfigure(1, weight=1)
 
-        # Kuuntelu + yhdistäminen
-        conn_frame = ttk.LabelFrame(mainframe, text="Yhteysasetukset (tämä sovellus on aina sekä palvelin että client)")
+        # Omat IP:t
+        ip_frame = ttk.LabelFrame(mainframe, text="Omat osoitteet")
+        ip_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(ip_frame, text="LAN IP (sisäverkko):").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        self.lan_ip_var = tk.StringVar(value="(selvitetään...)")
+        lan_entry = ttk.Entry(ip_frame, textvariable=self.lan_ip_var, state="readonly")
+        lan_entry.grid(row=0, column=1, sticky="we", padx=5, pady=2)
+
+        ttk.Label(ip_frame, text="WAN IP (julkinen):").grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        self.wan_ip_var = tk.StringVar(value="(selvitetään...)")
+        wan_entry = ttk.Entry(ip_frame, textvariable=self.wan_ip_var, state="readonly")
+        wan_entry.grid(row=1, column=1, sticky="we", padx=5, pady=2)
+
+        self.ip_refresh_btn = ttk.Button(ip_frame, text="Päivitä osoitteet", command=self._update_ips_async)
+        self.ip_refresh_btn.grid(row=0, column=2, rowspan=2, sticky="nsw", padx=5, pady=2)
+
+        ip_frame.columnconfigure(1, weight=1)
+
+        # Yhteysasetukset: suora + proxy
+        conn_frame = ttk.LabelFrame(mainframe, text="Yhteysasetukset")
         conn_frame.pack(fill="x", pady=(0, 10))
 
-        # Kuuntelu
-        ttk.Label(conn_frame, text="Oma kuunteluportti:").grid(row=0, column=0, sticky="e", padx=5, pady=2)
+        # Kuuntelu (suora)
+        ttk.Label(conn_frame, text="Oma kuunteluportti (suora P2P):").grid(row=0, column=0, sticky="e", padx=5, pady=2)
         self.listen_port_var = tk.StringVar(value="4433")
         listen_port_entry = ttk.Entry(conn_frame, textvariable=self.listen_port_var, width=8)
         listen_port_entry.grid(row=0, column=1, sticky="w", padx=5, pady=2)
-
         self.listen_btn = ttk.Button(conn_frame, text="Käynnistä kuuntelu", command=self._on_listen_clicked)
         self.listen_btn.grid(row=0, column=2, sticky="w", padx=5, pady=2)
 
-        # Yhdistä toiseen
-        ttk.Label(conn_frame, text="Yhdistä IP:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        # Suora yhteys
+        ttk.Label(conn_frame, text="Suora yhteys: IP:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
         self.remote_host_var = tk.StringVar(value="127.0.0.1")
         remote_host_entry = ttk.Entry(conn_frame, textvariable=self.remote_host_var, width=20)
         remote_host_entry.grid(row=1, column=1, sticky="w", padx=5, pady=2)
@@ -414,11 +510,31 @@ class SecureChatApp:
         remote_port_entry = ttk.Entry(conn_frame, textvariable=self.remote_port_var, width=8)
         remote_port_entry.grid(row=1, column=3, sticky="w", padx=5, pady=2)
 
-        self.connect_btn = ttk.Button(conn_frame, text="Yhdistä", command=self._on_connect_clicked)
-        self.connect_btn.grid(row=1, column=4, sticky="w", padx=5, pady=2)
+        self.connect_direct_btn = ttk.Button(conn_frame, text="Yhdistä suoraan", command=self._on_connect_direct_clicked)
+        self.connect_direct_btn.grid(row=1, column=4, sticky="w", padx=5, pady=2)
 
+        # Proxy-yhteys
+        ttk.Label(conn_frame, text="Välipalvelin (proxy) host:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
+        self.proxy_host_var = tk.StringVar(value="127.0.0.1")
+        proxy_host_entry = ttk.Entry(conn_frame, textvariable=self.proxy_host_var, width=20)
+        proxy_host_entry.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+
+        ttk.Label(conn_frame, text="Portti:").grid(row=2, column=2, sticky="e", padx=5, pady=2)
+        self.proxy_port_var = tk.StringVar(value="9000")
+        proxy_port_entry = ttk.Entry(conn_frame, textvariable=self.proxy_port_var, width=8)
+        proxy_port_entry.grid(row=2, column=3, sticky="w", padx=5, pady=2)
+
+        ttk.Label(conn_frame, text="Huonekoodi:").grid(row=2, column=4, sticky="e", padx=5, pady=2)
+        self.room_var = tk.StringVar(value="huone1")
+        room_entry = ttk.Entry(conn_frame, textvariable=self.room_var, width=15)
+        room_entry.grid(row=2, column=5, sticky="w", padx=5, pady=2)
+
+        self.connect_proxy_btn = ttk.Button(conn_frame, text="Yhdistä proxyllä", command=self._on_connect_proxy_clicked)
+        self.connect_proxy_btn.grid(row=2, column=6, sticky="w", padx=5, pady=2)
+
+        # Katkaise
         self.disconnect_btn = ttk.Button(conn_frame, text="Katkaise", command=self._on_disconnect_clicked)
-        self.disconnect_btn.grid(row=1, column=5, sticky="w", padx=5, pady=2)
+        self.disconnect_btn.grid(row=1, column=6, sticky="w", padx=5, pady=2)
         self.disconnect_btn["state"] = "disabled"
 
         conn_frame.columnconfigure(1, weight=1)
@@ -457,6 +573,17 @@ class SecureChatApp:
         status_label = ttk.Label(self.root, textvariable=self.status_var, anchor="w", relief="sunken")
         status_label.pack(fill="x", side="bottom")
 
+    # ---- IP:n päivitys ----
+
+    def _update_ips_async(self):
+        def worker():
+            lan = get_lan_ip()
+            wan = get_wan_ip()
+            self.event_queue.put(("ips", (lan, wan)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---- Button-handlerit ----
+
     def _on_listen_clicked(self):
         try:
             port = int(self.listen_port_var.get())
@@ -464,10 +591,10 @@ class SecureChatApp:
             messagebox.showerror("Virhe", "Portin on oltava numero.")
             return
         self.core.start_listener("0.0.0.0", port)
-        self._append_system(f"Aloitettiin kuuntelu portissa {port}.")
+        self._append_system(f"Aloitettiin suora kuuntelu portissa {port}.")
         self.listen_btn["state"] = "disabled"
 
-    def _on_connect_clicked(self):
+    def _on_connect_direct_clicked(self):
         host = self.remote_host_var.get().strip()
         if not host:
             messagebox.showerror("Virhe", "Anna IP-osoite.")
@@ -477,9 +604,27 @@ class SecureChatApp:
         except ValueError:
             messagebox.showerror("Virhe", "Portin on oltava numero.")
             return
-        self.core.connect_to(host, port)
-        self._append_system(f"Yritetään yhdistää {host}:{port} ...")
-        self.connect_btn["state"] = "disabled"
+        self.core.connect_direct(host, port)
+        self._append_system(f"Yritetään suoraa yhteyttä {host}:{port} ...")
+        self.connect_direct_btn["state"] = "disabled"
+
+    def _on_connect_proxy_clicked(self):
+        proxy_host = self.proxy_host_var.get().strip()
+        if not proxy_host:
+            messagebox.showerror("Virhe", "Anna välipalvelimen osoite.")
+            return
+        try:
+            proxy_port = int(self.proxy_port_var.get())
+        except ValueError:
+            messagebox.showerror("Virhe", "Proxy-portin on oltava numero.")
+            return
+        room = self.room_var.get().strip()
+        if not room:
+            messagebox.showerror("Virhe", "Huonekoodi ei voi olla tyhjä.")
+            return
+        self.core.connect_via_proxy(proxy_host, proxy_port, room)
+        self._append_system(f"Yritetään yhteyttä välipalvelimen kautta huoneeseen '{room}' ...")
+        self.connect_proxy_btn["state"] = "disabled"
 
     def _on_disconnect_clicked(self):
         self.core.disconnect()
@@ -490,6 +635,8 @@ class SecureChatApp:
             return
         self.core.send_text(text)
         self.msg_var.set("")
+
+    # ---- Event queue ----
 
     def _poll_events(self):
         try:
@@ -520,14 +667,16 @@ class SecureChatApp:
             self.connected = False
             self.send_btn["state"] = "disabled"
             self.disconnect_btn["state"] = "disabled"
-            self.connect_btn["state"] = "normal"
+            self.connect_direct_btn["state"] = "normal"
+            self.connect_proxy_btn["state"] = "normal"
         elif etype == "system":
             self._append_system(ev[1])
         elif etype == "error":
             self._append_system("[Virhe] " + ev[1])
             self.status_var.set(ev[1])
             if not self.connected:
-                self.connect_btn["state"] = "normal"
+                self.connect_direct_btn["state"] = "normal"
+                self.connect_proxy_btn["state"] = "normal"
         elif etype == "recv_msg":
             text, ts = ev[1]
             t = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "?"
@@ -540,6 +689,10 @@ class SecureChatApp:
             orig_text, orig_ts, ack_ts = ev[1]
             t = datetime.fromtimestamp(ack_ts).strftime("%H:%M:%S") if ack_ts else "?"
             self._append_chat(f"[{t}] ✔ Viesti luettu: {orig_text}\n", "system")
+        elif etype == "ips":
+            lan, wan = ev[1]
+            self.lan_ip_var.set(lan)
+            self.wan_ip_var.set(wan)
 
     def _append_chat(self, text, tag=None):
         self.chat.configure(state="normal")
@@ -554,7 +707,7 @@ class SecureChatApp:
         self._append_chat("* " + text + "\n", "system")
 
     def _on_close(self):
-        self.core.stop        ()
+        self.core.stop()
         self.root.destroy()
 
 
