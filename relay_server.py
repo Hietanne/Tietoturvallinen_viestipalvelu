@@ -90,7 +90,7 @@ def handle_client(conn, addr, rooms, rooms_lock):
             else:
                 other = rooms.pop(room)
 
-        # Tässä vaiheessa meillä on kaksi osapuolta samassa huoneessa
+        # Tässä vaiheessa huoneessa on kaksi osapuolta
         print(f"[INFO] Huone '{room}' täynnä, yhdistetään {addr} ja {other.getpeername()}")
         relay_pair(conn, other, addr, other.getpeername())
 
@@ -111,6 +111,7 @@ def main(host="0.0.0.0", port=9000):
     srv.bind((host, port))
     srv.listen(100)
     print(f"[INFO] Välipalvelin kuuntelee {host}:{port}")
+    print("[INFO] Käytä tätä osoitetta client-sovelluksessa Proxy host -kentässä.")
 
     try:
         while True:

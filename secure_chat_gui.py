@@ -19,6 +19,60 @@ from nacl.signing import SigningKey, VerifyKey
 from nacl.public import PrivateKey, PublicKey, Box
 from nacl.exceptions import BadSignatureError, CryptoError
 
+# UPnP (porttien automaattinen avaus WAN-suoraa varten)
+try:
+    import miniupnpc
+except ImportError:
+    miniupnpc = None
+
+
+class UpnpPortMapper:
+    def __init__(self):
+        self.upnp = None
+        self.external_ip = None
+        self.external_port = None
+        self.internal_port = None
+
+    def try_map(self, internal_port: int, description="SecureChat"):
+        """Yritä avata TCP-portti reitittimestä UPnP:llä."""
+        if miniupnpc is None:
+            return None
+
+        upnp = miniupnpc.UPnP()
+        upnp.discoverdelay = 2000  # 2 s
+        try:
+            upnp.discover()
+            upnp.selectigd()
+        except Exception:
+            return None
+
+        self.upnp = upnp
+        self.internal_port = internal_port
+
+        try:
+            external_port = internal_port
+            upnp.addportmapping(
+                external_port,
+                'TCP',
+                upnp.lanaddr,
+                internal_port,
+                description,
+                ''
+            )
+            self.external_ip = upnp.externalipaddress()
+            self.external_port = external_port
+            return f"{self.external_ip}:{self.external_port}"
+        except Exception:
+            return None
+
+    def remove_mapping(self):
+        if self.upnp and self.external_port:
+            try:
+                self.upnp.deleteportmapping(self.external_port, 'TCP')
+            except Exception:
+                pass
+
+
 IDENTITY_KEY_FILE = "id_ed25519.key"
 
 
@@ -66,7 +120,7 @@ def recv_frame(sock):
     return recv_exact(sock, length)
 
 
-# ---------- Kättely (symmetrinen, molemmat tekevät saman) ----------
+# ---------- Kättely ----------
 
 def make_handshake_message(identity_sk: SigningKey, eph_sk: PrivateKey):
     eph_pk_bytes = eph_sk.public_key.encode()
@@ -101,12 +155,6 @@ def parse_handshake_message(data: bytes):
 
 
 def perform_handshake(sock, identity_sk: SigningKey):
-    """
-    Symmetrinen kättely: molemmat osapuolet:
-      - generoi ephemeral-avaimen
-      - lähettää oman handshake-viestin
-      - lukee vastapuolen handshake-viestin
-    """
     eph_sk = PrivateKey.generate()
     outbound = make_handshake_message(identity_sk, eph_sk)
     send_frame(sock, outbound)
@@ -136,27 +184,17 @@ def recv_secure_message(sock, box: Box):
     return msg_obj
 
 
-# ---------- Ydin: yhdistetty server + client + valinnainen proxy ----------
+# ---------- Ydin: server + client + proxy ----------
 
 class SecureChatCore:
-    """
-    Hoitaa:
-    - kuuntelun (suora P2P),
-    - ulospäin yhdistämisen suoraan,
-    - yhdistämisen välipalvelimen (proxy) kautta,
-    - salauksen ja luku-kuittaukset.
-    """
-
     def __init__(self, event_queue: "queue.Queue"):
         self.event_queue = event_queue
         self.identity_sk, self.identity_vk, self.my_fingerprint, created = load_or_create_identity()
 
-        # Kuuntelu (suora P2P)
         self.listen_sock = None
         self.listen_thread = None
         self.listen_running = False
 
-        # Aktiivinen yhteys (suora tai proxy)
         self.sock = None
         self.box = None
         self.recv_thread = None
@@ -167,7 +205,7 @@ class SecureChatCore:
         self.sock_lock = threading.Lock()
 
         if created:
-            self.event_queue.put(("status", "Luotiin uusi identiteetti."))
+            self.event_queue.put(("status", "Luotiin uusi identiteetti tälle laitteelle."))
         else:
             self.event_queue.put(("status", "Käytetään olemassa olevaa identiteettiä."))
         self.event_queue.put(("my_fp", self.my_fingerprint))
@@ -189,7 +227,7 @@ class SecureChatCore:
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             srv.bind((host, port))
             srv.listen(5)
-            self.event_queue.put(("status", f"Kuunnellaan {host}:{port} (suora P2P)..."))
+            self.event_queue.put(("status", f"Kuunnellaan {host}:{port} (suora P2P / LAN / mahdollinen WAN)."))
             while self.listen_running:
                 try:
                     srv.settimeout(1.0)
@@ -277,7 +315,6 @@ class SecureChatCore:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             sock.connect((proxy_host, proxy_port))
-            # Ilmoita huone välipalvelimelle
             join_msg = {"type": "join", "room": room}
             try:
                 send_frame(sock, json.dumps(join_msg).encode("utf-8"))
@@ -287,7 +324,6 @@ class SecureChatCore:
                 return
             with self.sock_lock:
                 self.sock = sock
-            # Symmetrinen kättely vastapuolen kanssa välipalvelimen kautta
             try:
                 box, peer_fp = perform_handshake(sock, self.identity_sk)
             except Exception as e:
@@ -393,11 +429,9 @@ class SecureChatCore:
 # ---------- IP-osoitteiden selvittäminen ----------
 
 def get_lan_ip():
-    """Yritetään löytää LAN-osoite."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            # Ei tarvitse olla oikea, ei edes tarvitse saada yhteyttä
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
         finally:
@@ -411,7 +445,6 @@ def get_lan_ip():
 
 
 def get_wan_ip():
-    """Yritetään kysyä julkinen IP muutamasta palvelusta."""
     try:
         import urllib.request
         urls = [
@@ -436,19 +469,19 @@ def get_wan_ip():
 class SecureChatApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Tietoturvallinen P2P-viestintä (suora + proxy)")
-        self.root.geometry("1000x700")
+        self.root.title("Tietoturvallinen P2P-viestintä (LAN + Proxy + UPnP)")
+        self.root.geometry("1050x750")
 
         self.event_queue = queue.Queue()
         self.core = SecureChatCore(self.event_queue)
 
         self.connected = False
+        self.upnp_mapper = UpnpPortMapper()
 
         self._build_ui()
         self.root.after(100, self._poll_events)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Hae IP:t heti alussa
         self._update_ips_async()
 
     def _build_ui(self):
@@ -458,14 +491,31 @@ class SecureChatApp:
         title = ttk.Label(mainframe, text="Tietoturvallinen P2P-viestintä", font=("Segoe UI", 16, "bold"))
         title.pack(anchor="w", pady=(0, 5))
 
+        subtitle = ttk.Label(
+            mainframe,
+            text="Vihje: LANissa voit käyttää suoraa IP-yhteyttä. WANissa käytä mieluiten välipalvelinta (proxy). "
+                 "UPnP yrittää automaattisesti avata WAN-suoran portin, jos reititin sallii.",
+            wraplength=1000,
+            foreground="gray"
+        )
+        subtitle.pack(anchor="w", pady=(0, 10))
+
         # Oma identiteetti
         id_frame = ttk.LabelFrame(mainframe, text="Oma identiteetti")
         id_frame.pack(fill="x", pady=(0, 10))
 
         ttk.Label(id_frame, text="Sormenjälki (SHA-256):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.fp_var = tk.StringVar(value="–")
-        fp_entry = ttk.Entry(id_frame, textvariable=self.fp_var, width=70, state="readonly")
+        fp_entry = ttk.Entry(id_frame, textvariable=self.fp_var, width=80, state="readonly")
         fp_entry.grid(row=0, column=1, sticky="we", padx=5, pady=5)
+        hint = ttk.Label(
+            id_frame,
+            text="Vihje: vertailkaa sormenjälkiä toista kanavaa pitkin (esim. puhelu) varmistaaksenne, "
+                 "että kukaan ei ole välissä.",
+            foreground="gray",
+            wraplength=800
+        )
+        hint.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 5))
         id_frame.columnconfigure(1, weight=1)
 
         # Omat IP:t
@@ -482,13 +532,28 @@ class SecureChatApp:
         wan_entry = ttk.Entry(ip_frame, textvariable=self.wan_ip_var, state="readonly")
         wan_entry.grid(row=1, column=1, sticky="we", padx=5, pady=2)
 
+        ttk.Label(ip_frame, text="WAN-suora osoite (UPnP):").grid(row=2, column=0, sticky="e", padx=5, pady=2)
+        self.wan_direct_var = tk.StringVar(value="(ei saatavilla)")
+        wan_direct_entry = ttk.Entry(ip_frame, textvariable=self.wan_direct_var, state="readonly")
+        wan_direct_entry.grid(row=2, column=1, sticky="we", padx=5, pady=2)
+
         self.ip_refresh_btn = ttk.Button(ip_frame, text="Päivitä osoitteet", command=self._update_ips_async)
-        self.ip_refresh_btn.grid(row=0, column=2, rowspan=2, sticky="nsw", padx=5, pady=2)
+        self.ip_refresh_btn.grid(row=0, column=2, rowspan=3, sticky="nsw", padx=5, pady=2)
+
+        ip_hint = ttk.Label(
+            ip_frame,
+            text="LAN IP: käytä tätä osoitetta, kun toinen on samassa sisäverkossa.\n"
+                 "WAN-suora (UPnP): jos tämä kenttä näyttää osoitteen, toinen voi yhdistää siihen myös Internetistä "
+                 "suoralla yhteydellä.",
+            foreground="gray",
+            wraplength=800
+        )
+        ip_hint.grid(row=3, column=0, columnspan=3, sticky="w", padx=5, pady=(5, 2))
 
         ip_frame.columnconfigure(1, weight=1)
 
-        # Yhteysasetukset: suora + proxy
-        conn_frame = ttk.LabelFrame(mainframe, text="Yhteysasetukset")
+        # Yhteysasetukset
+        conn_frame = ttk.LabelFrame(mainframe, text="Yhteysasetukset (LAN / WAN / Proxy)")
         conn_frame.pack(fill="x", pady=(0, 10))
 
         # Kuuntelu (suora)
@@ -499,42 +564,69 @@ class SecureChatApp:
         self.listen_btn = ttk.Button(conn_frame, text="Käynnistä kuuntelu", command=self._on_listen_clicked)
         self.listen_btn.grid(row=0, column=2, sticky="w", padx=5, pady=2)
 
+        listen_hint = ttk.Label(
+            conn_frame,
+            text="Vihje: Paina 'Käynnistä kuuntelu' koneella, johon halutaan yhdistää. "
+                 "LANissa toinen käyttää LAN IP:tä. WANissa voit käyttää WAN-suoraa (UPnP) jos saat sen näkyviin.",
+            foreground="gray",
+            wraplength=800
+        )
+        listen_hint.grid(row=1, column=0, columnspan=7, sticky="w", padx=5, pady=(0, 5))
+
         # Suora yhteys
-        ttk.Label(conn_frame, text="Suora yhteys: IP:").grid(row=1, column=0, sticky="e", padx=5, pady=2)
+        ttk.Label(conn_frame, text="Suora yhteys: IP:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
         self.remote_host_var = tk.StringVar(value="127.0.0.1")
         remote_host_entry = ttk.Entry(conn_frame, textvariable=self.remote_host_var, width=20)
-        remote_host_entry.grid(row=1, column=1, sticky="w", padx=5, pady=2)
-
-        ttk.Label(conn_frame, text="Portti:").grid(row=1, column=2, sticky="e", padx=5, pady=2)
-        self.remote_port_var = tk.StringVar(value="4433")
-        remote_port_entry = ttk.Entry(conn_frame, textvariable=self.remote_port_var, width=8)
-        remote_port_entry.grid(row=1, column=3, sticky="w", padx=5, pady=2)
-
-        self.connect_direct_btn = ttk.Button(conn_frame, text="Yhdistä suoraan", command=self._on_connect_direct_clicked)
-        self.connect_direct_btn.grid(row=1, column=4, sticky="w", padx=5, pady=2)
-
-        # Proxy-yhteys
-        ttk.Label(conn_frame, text="Välipalvelin (proxy) host:").grid(row=2, column=0, sticky="e", padx=5, pady=2)
-        self.proxy_host_var = tk.StringVar(value="127.0.0.1")
-        proxy_host_entry = ttk.Entry(conn_frame, textvariable=self.proxy_host_var, width=20)
-        proxy_host_entry.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+        remote_host_entry.grid(row=2, column=1, sticky="w", padx=5, pady=2)
 
         ttk.Label(conn_frame, text="Portti:").grid(row=2, column=2, sticky="e", padx=5, pady=2)
+        self.remote_port_var = tk.StringVar(value="4433")
+        remote_port_entry = ttk.Entry(conn_frame, textvariable=self.remote_port_var, width=8)
+        remote_port_entry.grid(row=2, column=3, sticky="w", padx=5, pady=2)
+
+        self.connect_direct_btn = ttk.Button(conn_frame, text="Yhdistä suoraan", command=self._on_connect_direct_clicked)
+        self.connect_direct_btn.grid(row=2, column=4, sticky="w", padx=5, pady=2)
+
+        direct_hint = ttk.Label(
+            conn_frame,
+            text="Vihje: Syötä toisen koneen LAN IP ja portti (esim. 4433), jos olette samassa verkossa. "
+                 "Tai syötä WAN-suora osoite, jos UPnP on avannut portin.",
+            foreground="gray",
+            wraplength=800
+        )
+        direct_hint.grid(row=3, column=0, columnspan=7, sticky="w", padx=5, pady=(0, 5))
+
+        # Proxy-yhteys
+        ttk.Label(conn_frame, text="Välipalvelin (proxy) host:").grid(row=4, column=0, sticky="e", padx=5, pady=2)
+        self.proxy_host_var = tk.StringVar(value="127.0.0.1")
+        proxy_host_entry = ttk.Entry(conn_frame, textvariable=self.proxy_host_var, width=20)
+        proxy_host_entry.grid(row=4, column=1, sticky="w", padx=5, pady=2)
+
+        ttk.Label(conn_frame, text="Portti:").grid(row=4, column=2, sticky="e", padx=5, pady=2)
         self.proxy_port_var = tk.StringVar(value="9000")
         proxy_port_entry = ttk.Entry(conn_frame, textvariable=self.proxy_port_var, width=8)
-        proxy_port_entry.grid(row=2, column=3, sticky="w", padx=5, pady=2)
+        proxy_port_entry.grid(row=4, column=3, sticky="w", padx=5, pady=2)
 
-        ttk.Label(conn_frame, text="Huonekoodi:").grid(row=2, column=4, sticky="e", padx=5, pady=2)
+        ttk.Label(conn_frame, text="Huonekoodi:").grid(row=4, column=4, sticky="e", padx=5, pady=2)
         self.room_var = tk.StringVar(value="huone1")
         room_entry = ttk.Entry(conn_frame, textvariable=self.room_var, width=15)
-        room_entry.grid(row=2, column=5, sticky="w", padx=5, pady=2)
+        room_entry.grid(row=4, column=5, sticky="w", padx=5, pady=2)
 
         self.connect_proxy_btn = ttk.Button(conn_frame, text="Yhdistä proxyllä", command=self._on_connect_proxy_clicked)
-        self.connect_proxy_btn.grid(row=2, column=6, sticky="w", padx=5, pady=2)
+        self.connect_proxy_btn.grid(row=4, column=6, sticky="w", padx=5, pady=2)
+
+        proxy_hint = ttk.Label(
+            conn_frame,
+            text="Vihje: Proxy on varmin tapa WAN-yhteyteen. Aja 'relay_server.py' jossain julkisessa koneessa "
+                 "(esim. VPS), syötä sen IP/domain ja portti tähän. Molempien on käytettävä samaa huonekoodia.",
+            foreground="gray",
+            wraplength=800
+        )
+        proxy_hint.grid(row=5, column=0, columnspan=7, sticky="w", padx=5, pady=(0, 5))
 
         # Katkaise
         self.disconnect_btn = ttk.Button(conn_frame, text="Katkaise", command=self._on_disconnect_clicked)
-        self.disconnect_btn.grid(row=1, column=6, sticky="w", padx=5, pady=2)
+        self.disconnect_btn.grid(row=6, column=6, sticky="w", padx=5, pady=2)
         self.disconnect_btn["state"] = "disabled"
 
         conn_frame.columnconfigure(1, weight=1)
@@ -546,12 +638,20 @@ class SecureChatApp:
         self.peer_fp_var = tk.StringVar(value="(ei vielä kättelyä)")
         peer_fp_entry = ttk.Entry(peer_frame, textvariable=self.peer_fp_var, state="readonly")
         peer_fp_entry.grid(row=0, column=1, sticky="we", padx=5, pady=5)
+        peer_hint = ttk.Label(
+            peer_frame,
+            text="Vihje: kun yhteys on muodostettu, varmista ääni- tai tekstiviestillä, että tämä sormenjälki "
+                 "vastaa toisen näyttämää – näin havaitset mahdollisen hyökkääjän.",
+            foreground="gray",
+            wraplength=800
+        )
+        peer_hint.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 5))
         peer_frame.columnconfigure(1, weight=1)
 
         # Chat
         chat_frame = ttk.Frame(mainframe)
         chat_frame.pack(fill="both", expand=True, pady=(0, 5))
-        self.chat = scrolledtext.ScrolledText(chat_frame, height=20, state="disabled", wrap="word", font=("Segoe UI", 10))
+        self.chat = scrolledtext.ScrolledText(chat_frame, height=18, state="disabled", wrap="word", font=("Segoe UI", 10))
         self.chat.pack(fill="both", expand=True)
         self.chat.tag_config("me", foreground="blue")
         self.chat.tag_config("peer", foreground="green")
@@ -590,9 +690,20 @@ class SecureChatApp:
         except ValueError:
             messagebox.showerror("Virhe", "Portin on oltava numero.")
             return
+
         self.core.start_listener("0.0.0.0", port)
         self._append_system(f"Aloitettiin suora kuuntelu portissa {port}.")
         self.listen_btn["state"] = "disabled"
+
+        # Yritä UPnP-portinavausta
+        self._append_system("Yritetään automaattista UPnP-portinavausta WAN-suoraa varten...")
+        direct = self.upnp_mapper.try_map(port, "SecureChat")
+        if direct:
+            self.wan_direct_var.set(direct)
+            self._append_system(f"UPnP avasi WAN-suoran osoitteen: {direct}")
+        else:
+            self._append_system("UPnP-portinavaus ei onnistunut (reititin ei tue, estetty tai CG-NAT). "
+                                "WANissa käytä tällöin välipalvelinta (proxy).")
 
     def _on_connect_direct_clicked(self):
         host = self.remote_host_var.get().strip()
@@ -655,7 +766,7 @@ class SecureChatApp:
             self.fp_var.set(ev[1])
         elif etype == "peer_fp":
             self.peer_fp_var.set(ev[1])
-            self._append_system("Kättely valmis. Vertailkaa sormenjäljet toista kanavaa pitkin.")
+            self._append_system("Kättely valmis. Varmista sormenjäljet toista kanavaa pitkin.")
         elif etype == "connected":
             self.connected = True
             self.send_btn["state"] = "normal"
@@ -707,6 +818,10 @@ class SecureChatApp:
         self._append_chat("* " + text + "\n", "system")
 
     def _on_close(self):
+        try:
+            self.upnp_mapper.remove_mapping()
+        except Exception:
+            pass
         self.core.stop()
         self.root.destroy()
 
